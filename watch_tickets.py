@@ -2,25 +2,27 @@
 Odyssea IMAX-70mm ticket watcher for Cinema City Flora (Prague).
 
 How it works:
-- For each of the next WINDOW_DAYS days, opens the Cinema City "buy tickets
-  by cinema" page for Flora with that specific date in the URL.
-- Checks whether the text "IMAX-70mm" appears on the page for that date.
-  That label only shows up once IMAX-70mm sessions are actually bookable
-  for that day (confirmed from a real screenshot on 29.7.2026, where
-  29/30/31 July showed it and later dates did not yet).
-- Once a date is confirmed available, it is never re-checked again (saves
-  a lot of run time), so over time this only spends effort on the small
-  number of "not yet open" dates near the edge of the window.
+- For each of the next WINDOW_DAYS days, opens a FRESH browser page (no
+  reuse between dates, this matters because the site is a single-page app
+  and reusing a page can show stale content from the previous date if you
+  read too early) pointed at the Odyssea booking page for that date.
+- Waits until the page actually shows the requested date in its heading
+  (e.g. "02.08.2026") before reading anything, retrying a few times if not.
+- Extracts just the "PRAHA FLORA, OC FLORA" section of the page and checks
+  for "IMAX-70mm" there specifically.
+- Once a date is confirmed available, it is never re-checked again.
 - Sends a Telegram message the moment a previously-unavailable date flips
   to available.
 
 DEBUG_MODE:
 Run once with DEBUG_MODE=true (see workflow "Run workflow" button) to sanity
-check what the script sees, without sending any Telegram messages.
+check what the script sees for a handful of dates, without sending Telegram
+messages or saving state.
 """
 
 import json
 import os
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -28,9 +30,11 @@ from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
 
-CINEMA_ID = "1052"  # Praha Flora, OC FLORA
-CINEMA_SLUG = "flora"
+FILM_SLUG = "odyssea/7268s2r"
+CINEMA_HEADING = "PRAHA FLORA, OC FLORA"
 WINDOW_DAYS = 21  # how many days ahead to keep an eye on
+DEBUG_DAYS = 6  # how many days to check in debug mode (keep it quick)
+MAX_ATTEMPTS = 3  # retries per date if the page hasn't updated yet
 STATE_FILE = Path("state.json")
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
 
@@ -40,8 +44,9 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 def url_for_date(day: date) -> str:
     return (
-        f"https://cinemacity.cz/cinemas/{CINEMA_SLUG}/{CINEMA_ID}/"
-        f"#/buy-tickets-by-cinema?in-cinema={CINEMA_ID}&at={day.isoformat()}&view-mode=list"
+        f"https://cinemacity.cz/films/{FILM_SLUG}/"
+        f"#/buy-tickets-by-film?in-cinema=prague&at={day.isoformat()}"
+        f"&for-movie=7268s2r&view-mode=list"
     )
 
 
@@ -71,11 +76,48 @@ def dismiss_cookie_banner(page) -> None:
             pass
 
 
-def check_date_available(page, day: date) -> str:
-    """Returns the page text for manual inspection, caller checks for IMAX-70mm."""
-    page.goto(url_for_date(day), wait_until="networkidle", timeout=60000)
-    page.wait_for_timeout(2500)
-    return page.inner_text("body")
+def flora_section_text(full_text: str) -> str | None:
+    """Return just the chunk of text belonging to the Flora cinema, up to the
+    next cinema heading (all-caps line starting with 'PRAHA' or similar), or
+    None if the Flora heading isn't present at all."""
+    idx = full_text.find(CINEMA_HEADING)
+    if idx == -1:
+        return None
+    rest = full_text[idx + len(CINEMA_HEADING):]
+    # Cut off at the next cinema heading, which looks like "PRAHA X, ..." or
+    # another all-caps city name followed by a comma, on its own line.
+    match = re.search(r"\n[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ ]{4,},", rest)
+    if match:
+        rest = rest[: match.start()]
+    return rest
+
+
+def get_page_for_date(browser, day: date, dismiss_cookies: bool = False):
+    """Loads a fresh page for the given date, retrying until the page's own
+    heading confirms it actually rendered that date. Returns page text, or
+    None if it never confirmed after MAX_ATTEMPTS."""
+    target_heading = day.strftime("%d.%m.%Y")
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        page = browser.new_page()
+        page.goto(url_for_date(day), wait_until="networkidle", timeout=60000)
+
+        if dismiss_cookies and attempt == 1:
+            dismiss_cookie_banner(page)
+
+        page.wait_for_timeout(2500)
+        text = page.inner_text("body")
+
+        if target_heading in text:
+            page.close()
+            return text
+
+        page.close()
+        # not ready yet, small backoff then retry with a brand new page
+        import time
+        time.sleep(2)
+
+    return None  # gave up after MAX_ATTEMPTS
 
 
 def main() -> None:
@@ -83,40 +125,37 @@ def main() -> None:
     dates_state = state.get("dates", {})
     today = date.today()
 
-    # Drop dates in the past, no need to keep them around
     dates_state = {d: v for d, v in dates_state.items() if d >= today.isoformat()}
 
-    window = [today + timedelta(days=i) for i in range(WINDOW_DAYS)]
+    num_days = DEBUG_DAYS if DEBUG_MODE else WINDOW_DAYS
+    window = [today + timedelta(days=i) for i in range(num_days)]
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
-
-        # First load: dismiss cookie banner once
-        page.goto(url_for_date(window[0]), wait_until="networkidle", timeout=60000)
-        dismiss_cookie_banner(page)
-        page.wait_for_timeout(1500)
 
         newly_available = []
+        debug_lines = []
 
-        for day in window:
+        for i, day in enumerate(window):
             iso = day.isoformat()
 
+            if not DEBUG_MODE and dates_state.get(iso) is True:
+                continue  # already confirmed, skip re-checking
+
+            text = get_page_for_date(browser, day, dismiss_cookies=(i == 0))
+
+            if text is None:
+                debug_lines.append(f"{iso}: COULD NOT CONFIRM PAGE LOADED (skipped)")
+                continue
+
+            section = flora_section_text(text)
+            available = bool(section and "IMAX-70mm" in section)
+
             if DEBUG_MODE:
-                text = check_date_available(page, day)
-                available = "IMAX-70mm" in text
-                print(f"{iso}: IMAX-70mm available = {available}")
-                if day == window[0]:
+                debug_lines.append(f"{iso}: IMAX-70mm available = {available}")
+                if i == 0:
                     Path("debug_page_text.txt").write_text(text, encoding="utf-8")
-                    page.screenshot(path="debug_screenshot.png", full_page=True)
                 continue
-
-            # Skip dates we already confirmed as available, no need to recheck
-            if dates_state.get(iso) is True:
-                continue
-
-            text = check_date_available(page, day)
-            available = "IMAX-70mm" in text
 
             if available and not dates_state.get(iso, False):
                 newly_available.append(iso)
@@ -126,6 +165,7 @@ def main() -> None:
         browser.close()
 
     if DEBUG_MODE:
+        print("\n".join(debug_lines))
         print("DEBUG MODE: no Telegram message sent, no state saved.")
         sys.exit(0)
 
@@ -133,7 +173,7 @@ def main() -> None:
         msg = (
             "Odyssea IMAX-70mm Flora: nove otevrene terminy!\n"
             + "\n".join(newly_available)
-            + f"\n\nhttps://cinemacity.cz/films/odyssea/7268s2r"
+            + f"\n\nhttps://cinemacity.cz/films/{FILM_SLUG}"
         )
         send_telegram(msg)
     elif not state.get("initialized"):
