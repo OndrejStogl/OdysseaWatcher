@@ -2,9 +2,12 @@ name: Watch Odyssea IMAX tickets
 
 on:
   schedule:
-    # Runs roughly every 5 minutes (GitHub does not guarantee exact timing,
-    # can sometimes slip to 10-15 min during high load, but is usually close)
-    - cron: "*/5 * * * *"
+    # GitHub does not reliably run cron jobs every 5 minutes (can slip by
+    # hours). Instead, this fires every ~5 hours just to restart the
+    # watcher, which then loops internally and checks every few minutes
+    # for up to ~5h40m before exiting cleanly (see MAX_RUNTIME_SECONDS in
+    # watch_tickets.py). The "on: schedule" times below are UTC.
+    - cron: "0 */5 * * *"
   workflow_dispatch:
     # Lets you trigger it manually from the GitHub Actions tab, with an
     # option to run in debug mode
@@ -17,9 +20,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: odyssea-watcher
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -48,11 +56,11 @@ jobs:
             debug_screenshot.png
             debug_page_text.txt
 
-      - name: Commit updated state
+      - name: Commit updated state (safety net)
         if: ${{ github.event.inputs.debug != 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
-          git diff --quiet --cached || git commit -m "Update ticket state"
-          git push
+          git diff --quiet --cached || git commit -m "Update ticket state (final)"
+          git push || true
